@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>星尘工厂 · Idle</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#05070d;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+'use strict';
+
+/* ============================================================
+   1. 环境适配层（浏览器 / 微信小游戏 / 抖音小游戏）
+   ============================================================ */
+const isWX = typeof wx !== 'undefined' && typeof wx.createCanvas === 'function';
+const isTT = typeof tt !== 'undefined' && typeof tt.createCanvas === 'function';
+
+let canvas;
+if (isWX) canvas = wx.createCanvas();
+else if (isTT) canvas = tt.createCanvas();
+else canvas = document.getElementById('game');
+
+const ctx = canvas.getContext('2d');
+
+const raf = typeof requestAnimationFrame === 'function'
+  ? requestAnimationFrame
+  : function (fn) { return setTimeout(function () { fn(Date.now()); }, 16); };
+
+const Storage = {
+  get: function (k) {
+    try {
+      if (isWX) return wx.getStorageSync(k);
+      if (isTT) return tt.getStorageSync(k);
+      return localStorage.getItem(k);
+    } catch (e) { return null; }
+  },
+  set: function (k, v) {
+    try {
+      if (isWX) return wx.setStorageSync(k, v);
+      if (isTT) return tt.setStorageSync(k, v);
+      localStorage.setItem(k, v);
+    } catch (e) {}
+  }
+};
+
+const SFX = {
+  ac: null,
+  ensure: function () {
+    if (isWX || isTT) return;
+    if (!this.ac) {
+      try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { this.ac = null; }
+    }
+    if (this.ac && this.ac.state === 'suspended') this.ac.resume();
+  },
+  tone: function (f, dur, type, vol, to) {
+    if (!this.ac) return;
+    const t = this.ac.currentTime;
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f, t);
+    if (to) o.frequency.exponentialRampToValueAtTime(to, t + dur);
+    g.gain.setValueAtTime(vol || 0.04, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.ac.destination);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  click: function () { this.tone(760, 0.06, 'sine', 0.035, 1100); },
+  buy:   function () { this.tone(420, 0.10, 'triangle', 0.05, 720); },
+  deny:  function () { this.tone(180, 0.10, 'square', 0.03, 120); },
+  achieve: function () { this.tone(660, 0.14, 'sine', 0.05, 1320); },
+  prestige: function () { this.tone(300, 0.5, 'sine', 0.06, 1200); }
+};
+
+/* ============================================================
+   2. 配置
+   ============================================================ */
+const LOGIC_W = 480;
+const LOGIC_H = 854;
+
+const HEADER_H = 92;
+const CLICK_H  = 208;
+const BUYROW_H = 46;
+const TAB_H    = 48;
+const LIST_TOP = HEADER_H + CLICK_H + BUYROW_H + TAB_H;
+const PAD = 16;
+const COST_GROWTH = 1.15;
+const SAVE_KEY = 'stardust_factory_v1';
+const MAX_OFFLINE_SEC = 8 * 3600;
+const ACH_BONUS = 0.02;
+
+const BUILDINGS = [
+  { name: '星尘收集器', baseCost: 15,     baseProd: 0.5   },
+  { name: '太阳能阵列', baseCost: 130,    baseProd: 4     },
+  { name: '核聚变堆',   baseCost: 1500,   baseProd: 30    },
+  { name: '量子提取器', baseCost: 18000,  baseProd: 260   },
+  { name: '反物质引擎', baseCost: 220000, baseProd: 2300  },
+  { name: '戴森球',     baseCost: 3e6,    baseProd: 22000 },
+  { name: '时间晶体',   baseCost: 5e7,    baseProd: 210000},
+  { name: '奇点核心',   baseCost: 9e8,    baseProd: 2.5e6 }
+];
+
+const UPGRADES = [
+  { name:'强化点击',   desc:'点击收益 ×2',           cost:500,    eff:{clickMult:2} },
+  { name:'超频点击',   desc:'点击收益 ×3',           cost:5e4,    eff:{clickMult:3} },
+  { name:'点击大师',   desc:'点击收益 ×5',           cost:5e6,    eff:{clickMult:5} },
+  { name:'自动点击器', desc:'每秒自动点击 1 次',      cost:2e5,    eff:{autoClick:1} },
+  { name:'精密齿轮',   desc:'全局产出 ×1.25',        cost:3000,   eff:{globalMult:1.25} },
+  { name:'量子优化',   desc:'全局产出 ×1.5',         cost:3e5,    eff:{globalMult:1.5} },
+  { name:'时空压缩',   desc:'全局产出 ×2',           cost:8e7,    eff:{globalMult:2} },
+  { name:'收集器强化', desc:'星尘收集器产出 ×3',     cost:1500,   eff:{bIdx:0,bMult:3}, req:{bIdx:0,bCount:10} },
+  { name:'太阳能聚焦', desc:'太阳能阵列产出 ×3',     cost:1.5e4,  eff:{bIdx:1,bMult:3}, req:{bIdx:1,bCount:10} },
+  { name:'聚变点火',   desc:'核聚变堆产出 ×3',       cost:2e5,    eff:{bIdx:2,bMult:3}, req:{bIdx:2,bCount:10} },
+  { name:'量子纠缠',   desc:'量子提取器产出 ×3',     cost:2.5e6,  eff:{bIdx:3,bMult:3}, req:{bIdx:3,bCount:10} },
+  { name:'反物质约束', desc:'反物质引擎产出 ×3',     cost:3e7,    eff:{bIdx:4,bMult:3}, req:{bIdx:4,bCount:10} },
+  { name:'里程碑增效', desc:'里程碑倍率 2 → 2.5',     cost:1e7,    eff:{milestone:2.5} },
+  { name:'离线引擎',   desc:'离线收益 50% → 75%',    cost:5e4,    eff:{offline:0.75} },
+  { name:'永动核心',   desc:'离线收益 75% → 100%',   cost:8e6,    eff:{offline:1} }
+];
+
+const ACHIEVEMENTS = [
+  { name:'初次接触',   desc:'点击 1 次',        check:function(){ return S.totalClicks >= 1; } },
+  { name:'手指热身',   desc:'点击 100 次',      check:function(){ return S.totalClicks >= 100; } },
+  { name:'点击狂人',   desc:'点击 1000 次',     check:function(){ return S.totalClicks >= 1000; } },
+  { name:'点击之神',   desc:'点击 10000 次',    check:function(){ return S.totalClicks >= 10000; } },
+  { name:'第一桶金',   desc:'累计 1000 星尘',   check:function(){ return S.lifetime >= 1e3; } },
+  { name:'小有积蓄',   desc:'累计 10 万星尘',   check:function(){ return S.lifetime >= 1e5; } },
+  { name:'百万富翁',   desc:'累计 100 万星尘',  check:function(){ return S.lifetime >= 1e6; } },
+  { name:'亿万星辰',   desc:'累计 10 亿星尘',   check:function(){ return S.lifetime >= 1e9; } },
+  { name:'建造者',     desc:'拥有 10 个建筑',   check:function(){ return totalBuildings() >= 10; } },
+  { name:'工厂主',     desc:'拥有 100 个建筑',  check:function(){ return totalBuildings() >= 100; } },
+  { name:'星际帝国',   desc:'拥有 500 个建筑',  check:function(){ return totalBuildings() >= 500; } },
+  { name:'轮回者',     desc:'转生 1 次',        check:function(){ return S.prestiges >= 1; } },
+  { name:'永恒轮回',   desc:'转生 10 次',       check:function(){ return S.prestiges >= 10; } },
+  { name:'碎片收藏家', desc:'拥有 10 量子碎片', check:function(){ return S.shards >= 10; } },
+  { name:'工业革命',   desc:'每秒产出 1000',    check:function(){ return totalProduction() >= 1e3; } },
+  { name:'星际工厂',   desc:'每秒产出 100 万',  check:function(){ return totalProduction() >= 1e6; } }
+];
+
+const UNITS = ['', 'K', 'M', 'B', 'T', 'Qa', 'Qi', 'Sx', 'Sp', 'Oc', 'No', 'Dc'];
+
+/* ============================================================
+   3. 状态
+   ============================================================ */
+const S = {
+  stardust: 0,
+  lifetime: 0,
+  counts: BUILDINGS.map(function () { return 0; }),
+  shards: 0,
+  prestiges: 0,
+  totalClicks: 0,
+  upgrades: [],
+  achievements: [],
+  buyAmount: 1,
+  tab: 0,
+  scrollY: 0
+};
+
+let bonusCache = null;
+let regions = [];
+let floaters = [];
+let toasts = [];
+let clickAnim = 0;
+let prestigeConfirmAt = 0;
+let saveTimer = 0;
+let achTimer = 0;
+let autoTimer = 0;
+let lastTime = 0;
+let scale = 1, ox = 0, oy = 0, DPR = 1;
+
+/* ============================================================
+   4. 工具
+   ============================================================ */
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+function fmt(n) {
+  if (!isFinite(n)) return '∞';
+  if (n < 0) return '-' + fmt(-n);
+  if (n < 1000) {
+    if (n < 10) return String(Math.floor(n * 10) / 10);
+    return String(Math.floor(n));
+  }
+  let i = 0;
+  while (n >= 1000 && i < UNITS.length - 1) { n /= 1000; i++; }
+  const s = n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : String(Math.floor(n));
+  return s + UNITS[i];
+}
+
+function fmtTime(sec) {
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (h > 0) return h + '小时' + m + '分';
+  if (m > 0) return m + '分';
+  return sec + '秒';
+}
+
+function roundRect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+function toast(text, color) {
+  toasts.push({ text: text, color: color || '#e2e8f0', life: 2.8, maxLife: 2.8 });
+  if (toasts.length > 4) toasts.shift();
+}
+
+/* ============================================================
+   5. 加成聚合
+   ============================================================ */
+function invalidate() { bonusCache = null; }
+
+function getBonuses() {
+  if (bonusCache) return bonusCache;
+
+  const b = {
+    global: 1 + S.shards * 0.05,
+    achMult: 1 + S.achievements.length * ACH_BONUS,
+    clickMult: 1,
+    offlineRate: 0.5,
+    buildingMult: BUILDINGS.map(function () { return 1; }),
+    milestoneMult: 2,
+    autoClick: 0
+  };
+
+  for (let k = 0; k < S.upgrades.length; k++) {
+    const u = UPGRADES[S.upgrades[k]];
+    if (!u) continue;
+    const e = u.eff;
+    if (e.clickMult) b.clickMult *= e.clickMult;
+    if (e.globalMult) b.global *= e.globalMult;
+    if (e.bIdx !== undefined) b.buildingMult[e.bIdx] *= e.bMult;
+    if (e.milestone) b.milestoneMult = e.milestone;
+    if (e.offline !== undefined) b.offlineRate = e.offline;
+    if (e.autoClick) b.autoClick += e.autoClick;
+  }
+
+  bonusCache = b;
+  return b;
+}
+
+function rawProduction() {
+  const b = getBonuses();
+  let t = 0;
+  for (let i = 0; i < BUILDINGS.length; i++) {
+    const c = S.counts[i];
+    if (c === 0) continue;
+    const ms = Math.pow(b.milestoneMult, Math.floor(c / 10));
+    t += BUILDINGS[i].baseProd * c * ms * b.buildingMult[i];
+  }
+  return t;
+}
+
+function totalProduction() {
+  const b = getBonuses();
+  return rawProduction() * b.global * b.achMult;
+}
+
+function clickValue() {
+  const b = getBonuses();
+  return Math.max(1, rawProduction() * 0.05) * b.global * b.achMult * b.clickMult;
+}
+
+function totalBuildings() {
+  let t = 0;
+  for (let i = 0; i < S.counts.length; i++) t += S.counts[i];
+  return t;
+}
+
+/* ============================================================
+   6. 购买 / 转生 / 成就
+   ============================================================ */
+function costFor(i, n) {
+  const g = COST_GROWTH;
+  const start = BUILDINGS[i].baseCost * Math.pow(g, S.counts[i]);
+  return start * (Math.pow(g, n) - 1) / (g - 1);
+}
+
+function maxAffordable(i) {
+  const g = COST_GROWTH;
+  const start = BUILDINGS[i].baseCost * Math.pow(g, S.counts[i]);
+  const n = Math.floor(Math.log(1 + S.stardust * (g - 1) / start) / Math.log(g));
+  return Math.max(0, n);
+}
+
+function purchasePlan(i) {
+  if (S.buyAmount === 'max') {
+    const n = maxAffordable(i);
+    if (n > 0) return { n: n, cost: costFor(i, n) };
+    return { n: 1, cost: costFor(i, 1) };
+  }
+  return { n: S.buyAmount, cost: costFor(i, S.buyAmount) };
+}
+
+function shardsGained() {
+  return Math.floor(Math.sqrt(S.lifetime / 1e6));
+}
+
+function upgradeUnlocked(u) {
+  if (!u.req) return true;
+  if (u.req.bIdx !== undefined) return S.counts[u.req.bIdx] >= u.req.bCount;
+  return true;
+}
+
+function doClick() {
+  const v = clickValue();
+  S.stardust += v;
+  S.lifetime += v;
+  S.totalClicks++;
+  clickAnim = 1;
+  floaters.push({
+    x: LOGIC_W / 2 + (Math.random() - 0.5) * 80,
+    y: HEADER_H + 100 + (Math.random() - 0.5) * 40,
+    text: '+' + fmt(v),
+    life: 1, maxLife: 1
+  });
+  SFX.click();
+}
+
+function buyBuilding(i) {
+  const plan = purchasePlan(i);
+  if (S.stardust < plan.cost) { SFX.deny(); return; }
+  S.stardust -= plan.cost;
+  S.counts[i] += plan.n;
+  SFX.buy();
+}
+
+function buyUpgrade(i) {
+  const u = UPGRADES[i];
+  if (!u) return;
+  if (S.upgrades.indexOf(i) >= 0) return;
+  if (!upgradeUnlocked(u)) { SFX.deny(); return; }
+  if (S.stardust < u.cost) { SFX.deny(); return; }
+
+  S.stardust -= u.cost;
+  S.upgrades.push(i);
+  invalidate();
+  SFX.buy();
+  toast('已购买：' + u.name, '#22c55e');
+}
+
+function checkAchievements() {
+  let changed = false;
+  for (let i = 0; i < ACHIEVEMENTS.length; i++) {
+    if (S.achievements.indexOf(i) >= 0) continue;
+    if (ACHIEVEMENTS[i].check()) {
+      S.achievements.push(i);
+      changed = true;
+      toast('🏆 ' + ACHIEVEMENTS[i].name, '#fbbf24');
+    }
+  }
+  if (changed) { invalidate(); SFX.achieve(); }
+}
+
+function doPrestige() {
+  const g = shardsGained();
+  if (g <= 0) { SFX.deny(); return; }
+
+  const now = Date.now();
+  if (now - prestigeConfirmAt > 3000) {
+    prestigeConfirmAt = now;
+    toast('再次点击确认转生（3 秒内）', '#f59e0b');
+    return;
+  }
+
+  S.shards += g;
+  S.prestiges++;
+  S.stardust = 0;
+  S.lifetime = 0;
+  S.counts = BUILDINGS.map(function () { return 0; });
+  S.scrollY = 0;
+  prestigeConfirmAt = 0;
+  invalidate();
+  toast('转生成功！获得 ' + g + ' 量子碎片', '#a78bfa');
+  SFX.prestige();
+  saveGame();
+}
+
+/* ============================================================
+   7. 存档
+   ============================================================ */
+function saveGame() {
+  Storage.set(SAVE_KEY, JSON.stringify({
+    stardust: S.stardust,
+    lifetime: S.lifetime,
+    counts: S.counts,
+    shards: S.shards,
+    prestiges: S.prestiges,
+    totalClicks: S.totalClicks,
+    upgrades: S.upgrades,
+    achievements: S.achievements,
+    buyAmount: S.buyAmount,
+    lastSave: Date.now()
+  }));
+}
+
+function loadGame() {
+  const raw = Storage.get(SAVE_KEY);
+  if (!raw) return false;
+  try {
+    const d = typeof raw === 'string' ? JSON.parse(raw) : raw;
+
+    S.stardust = Number(d.stardust) || 0;
+    S.lifetime = Number(d.lifetime) || 0;
+    S.shards = Number(d.shards) || 0;
+    S.prestiges = Number(d.prestiges) || 0;
+    S.totalClicks = Number(d.totalClicks) || 0;
+    S.buyAmount = d.buyAmount || 1;
+
+    if (Array.isArray(d.counts)) {
+      for (let i = 0; i < BUILDINGS.length; i++) S.counts[i] = Number(d.counts[i]) || 0;
+    }
+
+    S.upgrades = Array.isArray(d.upgrades)
+      ? d.upgrades.filter(function (x) { return typeof x === 'number' && x >= 0 && x < UPGRADES.length; })
+      : [];
+    S.achievements = Array.isArray(d.achievements)
+      ? d.achievements.filter(function (x) { return typeof x === 'number' && x >= 0 && x < ACHIEVEMENTS.length; })
+      : [];
+
+    invalidate();
+
+    const elapsed = Math.min((Date.now() - (Number(d.lastSave) || Date.now())) / 1000, MAX_OFFLINE_SEC);
+    if (elapsed > 60) {
+      const rate = getBonuses().offlineRate;
+      const gain = totalProduction() * elapsed * rate;
+      if (gain > 0) {
+        S.stardust += gain;
+        S.lifetime += gain;
+        toast('离线 ' + fmtTime(elapsed) + '，获得 ' + fmt(gain) + ' 星尘', '#22c55e');
+      }
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ============================================================
+   8. 画布
+   ============================================================ */
+function resize() {
+  if (isWX) {
+    const i = wx.getSystemInfoSync();
+    DPR = i.pixelRatio || 1;
+    canvas.width = i.windowWidth * DPR;
+    canvas.height = i.windowHeight * DPR;
+  } else if (isTT) {
+    const i = tt.getSystemInfoSync();
+    DPR = i.pixelRatio || 1;
+    canvas.width = i.windowWidth * DPR;
+    canvas.height = i.windowHeight * DPR;
+  } else {
+    DPR = window.devicePixelRatio || 1;
+    const w = window.innerWidth, h = window.innerHeight;
+    canvas.width = Math.floor(w * DPR);
+    canvas.height = Math.floor(h * DPR);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+  }
+  scale = Math.min(canvas.width / LOGIC_W, canvas.height / LOGIC_H);
+  ox = (canvas.width - LOGIC_W * scale) / 2;
+  oy = (canvas.height - LOGIC_H * scale) / 2;
+}
+
+function toLogic(clientX, clientY) {
+  let px, py;
+  if (isWX || isTT) {
+    px = clientX * DPR;
+    py = clientY * DPR;
+  } else {
+    const r = canvas.getBoundingClientRect();
+    px = (clientX - r.left) * DPR;
+    py = (clientY - r.top) * DPR;
+  }
+  return { x: (px - ox) / scale, y: (py - oy) / scale };
+}
+
+/* ============================================================
+   9. 输入
+   ============================================================ */
+const ptr = { active: false, sx: 0, sy: 0, ly: 0, moved: false };
+
+function onDown(x, y) {
+  SFX.ensure();
+  ptr.active = true;
+  ptr.sx = ptr.ly = x;
+  ptr.sy = y;
+  ptr.moved = false;
+}
+
+function onMove(x, y) {
+  if (!ptr.active) return;
+  const dx = x - ptr.sx, dy = y - ptr.sy;
+  if (!ptr.moved && Math.hypot(dx, dy) > 12) ptr.moved = true;
+  if (ptr.moved && S.tab !== 2) {
+    S.scrollY = clamp(S.scrollY - (y - ptr.ly), 0, listScrollMax());
+  }
+  ptr.ly = y;
+}
+
+function onUp(x, y) {
+  if (!ptr.active) return;
+  ptr.active = false;
+  if (ptr.moved) return;
+
+  for (let i = 0; i < regions.length; i++) {
+    const r = regions[i];
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+      handleAction(r);
+      return;
+    }
+  }
+}
+
+function handleAction(r) {
+  if (r.action === 'click') doClick();
+  else if (r.action === 'tab') { S.tab = r.data; S.scrollY = 0; }
+  else if (r.action === 'buy') buyBuilding(r.data);
+  else if (r.action === 'upgrade') buyUpgrade(r.data);
+  else if (r.action === 'buyAmount') S.buyAmount = r.data;
+  else if (r.action === 'prestige') doPrestige();
+}
+
+function bindInput() {
+  if (isWX) {
+    wx.onTouchStart(function (e) { const t = e.touches[0]; const p = toLogic(t.clientX, t.clientY); onDown(p.x, p.y); });
+    wx.onTouchMove(function (e) { const t = e.touches[0]; const p = toLogic(t.clientX, t.clientY); onMove(p.x, p.y); });
+    wx.onTouchEnd(function (e) { const t = e.changedTouches[0]; const p = toLogic(t.clientX, t.clientY); onUp(p.x, p.y); });
+    wx.onTouchCancel(function () { ptr.active = false; });
+  } else if (isTT) {
+    tt.onTouchStart(function (e) { const t = e.touches[0]; const p = toLogic(t.clientX, t.clientY); onDown(p.x, p.y); });
+    tt.onTouchMove(function (e) { const t = e.touches[0]; const p = toLogic(t.clientX, t.clientY); onMove(p.x, p.y); });
+    tt.onTouchEnd(function (e) { const t = e.changedTouches[0]; const p = toLogic(t.clientX, t.clientY); onUp(p.x, p.y); });
+    tt.onTouchCancel(function () { ptr.active = false; });
+  } else {
+    canvas.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      const p = toLogic(e.clientX, e.clientY);
+      onDown(p.x, p.y);
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }, { passive: false });
+    canvas.addEventListener('pointermove', function (e) {
+      const p = toLogic(e.clientX, e.clientY);
+      onMove(p.x, p.y);
+    }, { passive: false });
+    canvas.addEventListener('pointerup', function (e) {
+      const p = toLogic(e.clientX, e.clientY);
+      onUp(p.x, p.y);
+    });
+    canvas.addEventListener('pointercancel', function () { ptr.active = false; });
+    window.addEventListener('resize', resize);
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) saveGame();
+    });
+  }
+}
+
+/* ============================================================
+   10. 滚动
+   ============================================================ */
+function listContentHeight() {
+  if (S.tab === 0) return 10 + BUILDINGS.length * 102;
+  if (S.tab === 1) return 10 + UPGRADES.length * 86;
+  if (S.tab === 3) return 10 + 56 + ACHIEVEMENTS.length * 76;
+  return 0;
+}
+
+function listScrollMax() {
+  return Math.max(0, listContentHeight() - (LOGIC_H - LIST_TOP));
+}
+
+/* ============================================================
+   11. 更新
+   ============================================================ */
+function update(dt) {
+  const b = getBonuses();
+
+  // 自动点击
+  if (b.autoClick > 0) {
+    autoTimer += dt;
+    const interval = 1 / b.autoClick;
+    while (autoTimer >= interval) {
+      autoTimer -= interval;
+      const v = clickValue();
+      S.stardust += v;
+      S.lifetime += v;
+      S.totalClicks++;
+    }
+  }
+
+  const prod = totalProduction();
+  S.stardust += prod * dt;
+  S.lifetime += prod * dt;
+
+  // 成就检查
+  achTimer += dt;
+  if (achTimer >= 1) { achTimer = 0; checkAchievements(); }
+
+  if (clickAnim > 0) clickAnim = Math.max(0, clickAnim - dt * 5);
+
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    floaters[i].life -= dt;
+    if (floaters[i].life <= 0) floaters.splice(i, 1);
+  }
+
+  for (let i = toasts.length - 1; i >= 0; i--) {
+    toasts[i].life -= dt;
+    if (toasts[i].life <= 0) toasts.splice(i, 1);
+  }
+
+  if (prestigeConfirmAt && Date.now() - prestigeConfirmAt > 3000) prestigeConfirmAt = 0;
+
+  saveTimer += dt;
+  if (saveTimer > 10) { saveTimer = 0; saveGame(); }
+}
+
+/* ============================================================
+   12. 渲染
+   ============================================================ */
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#05070d';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(scale, 0, 0, scale, ox, oy);
+
+  regions = [];
+
+  drawHeader();
+  drawClickArea();
+  drawBuyRow();
+  drawTabs();
+  drawContent();
+  drawFloaters();
+  drawToasts();
+}
+
+function drawHeader() {
+  const b = getBonuses();
+  const totalMult = b.global * b.achMult;
+
+  ctx.fillStyle = '#0b1220';
+  ctx.fillRect(0, 0, LOGIC_W, HEADER_H);
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 30px sans-serif';
+  ctx.fillText('✦ ' + fmt(S.stardust), PAD, 16);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#7dd3fc';
+  ctx.font = '14px sans-serif';
+  ctx.fillText(fmt(totalProduction()) + ' /秒', LOGIC_W - PAD, 24);
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#a78bfa';
+  ctx.font = '13px sans-serif';
+  ctx.fillText('碎片 ' + S.shards + '  ·  成就 ' + S.achievements.length + '/' + ACHIEVEMENTS.length, PAD, 60);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#22c55e';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.fillText('加成 ×' + totalMult.toFixed(2), LOGIC_W - PAD, 60);
+}
+
+function drawClickArea() {
+  const cx = LOGIC_W / 2;
+  const cy = HEADER_H + CLICK_H / 2;
+  const baseR = 76;
+  const r = baseR * (1 + clickAnim * 0.07);
+
+  const halo = ctx.createRadialGradient(cx, cy, r * 0.6, cx, cy, r * 1.35);
+  halo.addColorStop(0, 'rgba(251,191,36,0.22)');
+  halo.addColorStop(1, 'rgba(251,191,36,0)');
+  ctx.fillStyle = halo;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 1.35, 0, Math.PI * 2);
+  ctx.fill();
+
+  const g = ctx.createRadialGradient(cx, cy - r * 0.35, r * 0.15, cx, cy, r);
+  g.addColorStop(0, '#fef3c7');
+  g.addColorStop(0.5, '#fbbf24');
+  g.addColorStop(1, '#d97706');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#451a03';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillText('收 集', cx, cy - 12);
+
+  ctx.fillStyle = '#78350f';
+  ctx.font = 'bold 15px sans-serif';
+  ctx.fillText('+' + fmt(clickValue()), cx, cy + 20);
+
+  regions.push({ x: cx - r, y: cy - r, w: r * 2, h: r * 2, action: 'click' });
+}
+
+function drawBuyRow() {
+  const y = HEADER_H + CLICK_H;
+  ctx.fillStyle = '#080d18';
+  ctx.fillRect(0, y, LOGIC_W, BUYROW_H);
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#64748b';
+  ctx.font = '13px sans-serif';
+  ctx.fillText('购买数量', PAD, y + BUYROW_H / 2);
+
+  const opts = [1, 10, 'max'];
+  const labels = ['×1', '×10', 'MAX'];
+  const bw = 62, bh = 30, gap = 8;
+  const startX = LOGIC_W - PAD - (bw * 3 + gap * 2);
+
+  for (let i = 0; i < opts.length; i++) {
+    const bx = startX + i * (bw + gap);
+    const by = y + (BUYROW_H - bh) / 2;
+    const active = S.buyAmount === opts[i];
+
+    ctx.fillStyle = active ? '#f59e0b' : '#162034';
+    roundRect(ctx, bx, by, bw, bh, 7);
+    ctx.fill();
+
+    ctx.fillStyle = active ? '#1c1917' : '#94a3b8';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(labels[i], bx + bw / 2, by + bh / 2 + 1);
+
+    regions.push({ x: bx, y: by, w: bw, h: bh, action: 'buyAmount', data: opts[i] });
+  }
+}
+
+function drawTabs() {
+  const y = HEADER_H + CLICK_H + BUYROW_H;
+  const tabs = ['建筑', '升级', '转生', '成就'];
+  const tw = LOGIC_W / tabs.length;
+
+  for (let i = 0; i < tabs.length; i++) {
+    const x = i * tw;
+    const active = S.tab === i;
+
+    ctx.fillStyle = active ? '#162034' : '#0b1220';
+    ctx.fillRect(x, y, tw, TAB_H);
+
+    ctx.fillStyle = active ? '#fbbf24' : '#64748b';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(tabs[i], x + tw / 2, y + TAB_H / 2);
+
+    if (active) {
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillRect(x + tw / 2 - 18, y + TAB_H - 3, 36, 3);
+    }
+
+    regions.push({ x: x, y: y, w: tw, h: TAB_H, action: 'tab', data: i });
+  }
+}
+
+function drawContent() {
+  const viewH = LOGIC_H - LIST_TOP;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, LIST_TOP, LOGIC_W, viewH);
+  ctx.clip();
+
+  if (S.tab === 0) drawBuildings(viewH);
+  else if (S.tab === 1) drawUpgrades(viewH);
+  else if (S.tab === 2) drawPrestige(viewH);
+  else drawAchievements(viewH);
+
+  ctx.restore();
+}
+
+/* ---------- 建筑 ---------- */
+function drawBuildings(viewH) {
+  const cardH = 92, gap = 10;
+  const w = LOGIC_W - PAD * 2;
+  const b = getBonuses();
+  const totalMult = b.global * b.achMult;
+
+  for (let i = 0; i < BUILDINGS.length; i++) {
+    const bd = BUILDINGS[i];
+    const y = LIST_TOP + 10 + i * (cardH + gap) - S.scrollY;
+    if (y + cardH < LIST_TOP || y > LIST_TOP + viewH) continue;
+
+    const c = S.counts[i];
+    const x = PAD;
+
+    ctx.fillStyle = c > 0 ? '#111c30' : '#0c1424';
+    roundRect(ctx, x, y, w, cardH, 12);
+    ctx.fill();
+
+    if (c > 0) {
+      ctx.strokeStyle = 'rgba(251,191,36,0.25)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, x + 0.5, y + 0.5, w - 1, cardH - 1, 12);
+      ctx.stroke();
+    }
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = c > 0 ? '#f1f5f9' : '#94a3b8';
+    ctx.font = 'bold 17px sans-serif';
+    ctx.fillText(bd.name, x + 16, y + 14);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = c > 0 ? '#fbbf24' : '#475569';
+    ctx.font = 'bold 17px sans-serif';
+    ctx.fillText('×' + c, x + w - 16, y + 14);
+
+    let info = '尚未建造';
+    if (c > 0) {
+      const ms = Math.pow(b.milestoneMult, Math.floor(c / 10));
+      const prod = bd.baseProd * c * ms * b.buildingMult[i] * totalMult;
+      info = fmt(prod) + ' /秒';
+      if (c >= 10) info += '  ·  里程碑 ×' + fmt(Math.pow(b.milestoneMult, Math.floor(c / 10)));
+    }
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#64748b';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(info, x + 16, y + 42);
+
+    const plan = purchasePlan(i);
+    const can = S.stardust >= plan.cost;
+    const btnW = 172, btnH = 34;
+    const bx = x + w - btnW - 14;
+    const by = y + cardH - btnH - 12;
+
+    ctx.fillStyle = can ? '#16a34a' : '#1e293b';
+    roundRect(ctx, bx, by, btnW, btnH, 8);
+    ctx.fill();
+
+    ctx.fillStyle = can ? '#ffffff' : '#64748b';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('买 ×' + plan.n + '   ' + fmt(plan.cost), bx + btnW / 2, by + btnH / 2 + 1);
+
+    const cy = by + btnH / 2;
+    if (cy >= LIST_TOP && cy <= LIST_TOP + viewH) {
+      regions.push({ x: bx, y: by, w: btnW, h: btnH, action: 'buy', data: i });
+    }
+  }
+}
+
+/* ---------- 升级 ---------- */
+function drawUpgrades(viewH) {
+  const cardH = 78, gap = 8;
+  const w = LOGIC_W - PAD * 2;
+
+  for (let i = 0; i < UPGRADES.length; i++) {
+    const u = UPGRADES[i];
+    const y = LIST_TOP + 10 + i * (cardH + gap) - S.scrollY;
+    if (y + cardH < LIST_TOP || y > LIST_TOP + viewH) continue;
+
+    const owned = S.upgrades.indexOf(i) >= 0;
+    const unlocked = upgradeUnlocked(u);
+    const x = PAD;
+
+    ctx.fillStyle = owned ? '#0f2a1a' : (unlocked ? '#111c30' : '#0a1018');
+    roundRect(ctx, x, y, w, cardH, 10);
+    ctx.fill();
+
+    if (owned) {
+      ctx.strokeStyle = 'rgba(34,197,94,0.35)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, x + 0.5, y + 0.5, w - 1, cardH - 1, 10);
+      ctx.stroke();
+    }
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = owned ? '#4ade80' : (unlocked ? '#f1f5f9' : '#475569');
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText(u.name, x + 14, y + 12);
+
+    ctx.fillStyle = unlocked ? '#94a3b8' : '#334155';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(u.desc, x + 14, y + 38);
+
+    if (owned) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#22c55e';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('已拥有 ✓', x + w - 16, y + cardH / 2);
+    } else if (!unlocked) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#475569';
+      ctx.font = '12px sans-serif';
+      ctx.textBaseline = 'middle';
+      const r = u.req;
+      ctx.fillText('需要 ' + BUILDINGS[r.bIdx].name + ' ×' + r.bCount, x + w - 16, y + cardH / 2);
+    } else {
+      const can = S.stardust >= u.cost;
+      const bw = 130, bh = 34;
+      const bx = x + w - bw - 12;
+      const by = y + (cardH - bh) / 2;
+
+      ctx.fillStyle = can ? '#16a34a' : '#1e293b';
+      roundRect(ctx, bx, by, bw, bh, 8);
+      ctx.fill();
+
+      ctx.fillStyle = can ? '#ffffff' : '#64748b';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('✦ ' + fmt(u.cost), bx + bw / 2, by + bh / 2 + 1);
+
+      const cy = by + bh / 2;
+      if (cy >= LIST_TOP && cy <= LIST_TOP + viewH) {
+        regions.push({ x: bx, y: by, w: bw, h: bh, action: 'upgrade', data: i });
+      }
+    }
+  }
+}
+
+/* ---------- 成就 ---------- */
+function drawAchievements(viewH) {
+  const rowH = 68, gap = 8;
+  const w = LOGIC_W - PAD * 2;
+  const got = S.achievements.length;
+  const total = ACHIEVEMENTS.length;
+
+  const headY = LIST_TOP + 10 - S.scrollY;
+  if (headY + 50 > LIST_TOP && headY < LIST_TOP + viewH) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText('已解锁 ' + got + ' / ' + total, LOGIC_W / 2, headY);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('每个成就 +2% 全局产出 · 当前 +' + (got * 2) + '%', LOGIC_W / 2, headY + 26);
+  }
+
+  const startY = LIST_TOP + 10 + 56 - S.scrollY;
+
+  for (let i = 0; i < ACHIEVEMENTS.length; i++) {
+    const a = ACHIEVEMENTS[i];
+    const y = startY + i * (rowH + gap);
+    if (y + rowH < LIST_TOP || y > LIST_TOP + viewH) continue;
+
+    const unlocked = S.achievements.indexOf(i) >= 0;
+    const x = PAD;
+
+    ctx.fillStyle = unlocked ? '#1a1408' : '#0c1424';
+    roundRect(ctx, x, y, w, rowH, 10);
+    ctx.fill();
+
+    if (unlocked) {
+      ctx.strokeStyle = 'rgba(251,191,36,0.35)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, x + 0.5, y + 0.5, w - 1, rowH - 1, 10);
+      ctx.stroke();
+    }
+
+    const icx = x + 30, icy = y + rowH / 2;
+    ctx.beginPath();
+    ctx.arc(icx, icy, 16, 0, Math.PI * 2);
+    ctx.fillStyle = unlocked ? '#fbbf24' : '#1e293b';
+    ctx.fill();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = unlocked ? '#1c1917' : '#475569';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText(unlocked ? '✓' : '?', icx, icy + 1);
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = unlocked ? '#fef3c7' : '#64748b';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText(a.name, x + 58, y + 14);
+
+    ctx.fillStyle = unlocked ? '#a8a29e' : '#475569';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(a.desc, x + 58, y + 38);
+
+    if (unlocked) {
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#22c55e';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillText('+2%', x + w - 16, y + rowH / 2);
+    }
+  }
+}
+
+/* ---------- 转生 ---------- */
+function drawPrestige(viewH) {
+  const cx = LOGIC_W / 2;
+  let y = LIST_TOP + 24;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+
+  ctx.fillStyle = '#c4b5fd';
+  ctx.font = 'bold 26px sans-serif';
+  ctx.fillText('量子碎片 ' + S.shards, cx, y);
+  y += 38;
+
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '14px sans-serif';
+  ctx.fillText('每个碎片提供 +5% 全局产出', cx, y);
+  y += 24;
+
+  ctx.fillStyle = '#64748b';
+  ctx.font = '13px sans-serif';
+  ctx.fillText('已转生 ' + S.prestiges + ' 次', cx, y);
+  y += 36;
+
+  ctx.strokeStyle = 'rgba(148,163,184,0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(PAD * 2, y);
+  ctx.lineTo(LOGIC_W - PAD * 2, y);
+  ctx.stroke();
+  y += 30;
+
+  const g = shardsGained();
+  ctx.fillStyle = g > 0 ? '#22c55e' : '#64748b';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillText(g > 0 ? '本次转生可得 ' + g + ' 碎片' : '继续积累星尘', cx, y);
+  y += 40;
+
+  const lo = g * g * 1e6;
+  const hi = (g + 1) * (g + 1) * 1e6;
+  const prog = clamp((S.lifetime - lo) / (hi - lo), 0, 1);
+
+  const barW = LOGIC_W - PAD * 4;
+  const barX = PAD * 2;
+  const barH = 14;
+
+  ctx.fillStyle = '#0c1424';
+  roundRect(ctx, barX, y, barW, barH, 7);
+  ctx.fill();
+
+  ctx.fillStyle = '#7c3aed';
+  roundRect(ctx, barX, y, Math.max(barH, barW * prog), barH, 7);
+  ctx.fill();
+
+  y += barH + 12;
+
+  ctx.fillStyle = '#64748b';
+  ctx.font = '12px sans-serif';
+  ctx.fillText('累计星尘 ' + fmt(S.lifetime) + '  /  ' + fmt(hi), cx, y);
+  y += 40;
+
+  ctx.fillStyle = '#64748b';
+  ctx.font = '13px sans-serif';
+  ctx.fillText('转生将重置星尘与全部建筑', cx, y);
+  y += 20;
+  ctx.fillText('升级与成就会永久保留', cx, y);
+  y += 44;
+
+  const canP = g > 0;
+  const btnW = LOGIC_W - PAD * 4;
+  const btnH = 54;
+  const bx = PAD * 2;
+
+  ctx.fillStyle = canP ? '#7c3aed' : '#1e293b';
+  roundRect(ctx, bx, y, btnW, btnH, 12);
+  ctx.fill();
+
+  const confirming = prestigeConfirmAt && Date.now() - prestigeConfirmAt <= 3000;
+  ctx.fillStyle = canP ? '#ffffff' : '#64748b';
+  ctx.font = 'bold 19px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(
+    confirming ? '再次点击确认转生' : (canP ? '转 生  (+' + g + ' 碎片)' : '碎片不足'),
+    bx + btnW / 2, y + btnH / 2 + 1
+  );
+
+  if (canP) {
+    regions.push({ x: bx, y: y, w: btnW, h: btnH, action: 'prestige' });
+  }
+}
+
+/* ---------- 浮层 ---------- */
+function drawFloaters() {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 19px sans-serif';
+  for (let i = 0; i < floaters.length; i++) {
+    const f = floaters[i];
+    const t = 1 - f.life / f.maxLife;
+    ctx.globalAlpha = Math.max(0, f.life / f.maxLife);
+    ctx.fillStyle = '#fde68a';
+    ctx.fillText(f.text, f.x, f.y - t * 70);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawToasts() {
+  let y = 104;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 14px sans-serif';
+
+  for (let i = 0; i < toasts.length; i++) {
+    const t = toasts[i];
+    const a = Math.min(1, t.life / 0.5);
+    const w = Math.min(LOGIC_W - 40, t.text.length * 15 + 34);
+
+    ctx.globalAlpha = a * 0.9;
+    ctx.fillStyle = '#0f172a';
+    roundRect(ctx, LOGIC_W / 2 - w / 2, y - 15, w, 30, 15);
+    ctx.fill();
+
+    ctx.globalAlpha = a;
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.text, LOGIC_W / 2, y + 1);
+
+    y += 38;
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ============================================================
+   13. 主循环
+   ============================================================ */
+function loop(now) {
+  now = now || Date.now();
+  if (!lastTime) lastTime = now;
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (dt > 1) dt = 1;
+  if (dt < 0) dt = 0;
+
+  update(dt);
+  render();
+  raf(loop);
+}
+
+/* ============================================================
+   14. 启动
+   ============================================================ */
+resize();
+bindInput();
+
+if (!loadGame()) {
+  toast('点击中央按钮收集星尘', '#fbbf24');
+}
+
+if (isWX && wx.onShow) wx.onShow(function () { lastTime = 0; resize(); });
+if (isTT && tt.onShow) tt.onShow(function () { lastTime = 0; resize(); });
+if (isWX && wx.onHide) wx.onHide(function () { saveGame(); });
+if (isTT && tt.onHide) tt.onHide(function () { saveGame(); });
+
+lastTime = Date.now();
+raf(loop);
+
+})();
+</script>
+</body>
+</html>
